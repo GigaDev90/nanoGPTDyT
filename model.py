@@ -15,6 +15,23 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+class DyT(nn.Module):
+    def __init__(self, n_embd, init_alpha = 0.5):
+        super().__init__()
+        # Learnable scalar parameter for dynamic scaling
+        self.alpha = nn.Parameter(torch.ones(1) * init_alpha)
+        # Learnable per-channel scaling (gamma) and shifting (beta) parameters
+        self.gamma = nn.Parameter(torch.ones(n_embd))
+        self.beta = nn.Parameter(torch.zeros(n_embd))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply the dynamic tanh function
+        x = torch.tanh(self.alpha * x)
+        # Reshape gamma and beta for broadcasting over batch and tokens dimensions
+        gamma = self.gamma.view(1, 1, -1)
+        beta = self.beta.view(1, 1, -1)
+        return gamma * x + beta
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -95,9 +112,16 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        if config.dyt_norm:
+            self.ln_1 = DyT(config.n_embd)
+            self.ln_2 = DyT(config.n_embd)
+
+        else:
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+
+
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -114,6 +138,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    dyt_norm : bool = False
 
 class GPT(nn.Module):
 
@@ -128,8 +153,12 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        if config.dyt_norm:
+            self.ln_f = DyT(config.n_embd)
+        else:
+            self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -179,7 +208,7 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
